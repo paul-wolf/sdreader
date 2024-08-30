@@ -1,0 +1,31 @@
+[tool.ruff]
+# Specify the line length for the linter
+line-length = 120
+
+# Enable specific rules (you can add more as needed)
+select = [
+    "E",  # Pycodestyle errors
+    "F",  # Pyflakes errors
+    "W",  # Pycodestyle warnings
+    "C90",  # McCabe complexity
+]
+
+# Exclude specific directories or files
+exclude = [
+    ".venv",
+    "__pycache__",
+    ".git",
+    "build",
+    "dist",
+]
+
+# Enable autofix for certain rules
+fix = true
+
+# Add any additional settings or rules you want to enable/disable
+ignore = [
+    "E501",  # Ignore line length errors
+]
+
+# Specify the target Python version
+target-version = "py312"
