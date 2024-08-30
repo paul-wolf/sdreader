@@ -211,5 +211,6 @@ def create_gui(mounts):
 
 if __name__ == "__main__":
     mounts = get_mounts()
-    mounts = [m for m in mounts if "/System/Volumes" not in m["mount_point"]]
+    mounts = [m for m in mounts if "/Volumes" in m["mount_point"] and "/System/Volumes" not in m["mount_point"]]
+    print(mounts)
     create_gui(mounts)
