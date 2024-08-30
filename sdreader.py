@@ -4,6 +4,13 @@ import subprocess
 import tkinter as tk
 from tkinter import ttk
 from datetime import datetime
+import threading
+import signal
+import sys
+
+
+def plog(message):
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
 
 
 def is_sd_card_mac(device):
@@ -22,14 +29,7 @@ def is_sd_card(device, mount_point):
             return True
     elif os.name == "nt":
         result = subprocess.run(
-            [
-                "wmic",
-                "logicaldisk",
-                "where",
-                f"DeviceID='{device}'",
-                "get",
-                "MediaType",
-            ],
+            ["wmic", "logicaldisk", "where", f"DeviceID='{device}'", "get", "MediaType"],
             capture_output=True,
             text=True,
         )
@@ -112,39 +112,40 @@ def write_selected_mounts(selected_mounts, filename="selected_mounts.txt"):
         for mount in selected_mounts:
             f.write(f"{mount}\n")
 
-def plog(s):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    print(f"{timestamp}: {s}")
 
-def copy_sd_card_contents(mount_point, destination_dir, progress_var, progress_bar):
-    
+def copy_sd_card_contents(mount_point, destination_dir):
     if not os.path.exists(destination_dir):
-        plog("Making directory: " + destination_dir)
         os.makedirs(destination_dir)
-    total_files = sum([len(files) for _, _, files in os.walk(mount_point)])
-    copied_files = 0
     for root, dirs, files in os.walk(mount_point):
         relative_path = os.path.relpath(root, mount_point)
         dest_path = os.path.join(destination_dir, relative_path)
         if not os.path.exists(dest_path):
-            plog("Making directory: " + destination_dir)        
             os.makedirs(dest_path)
         for file in files:
             src_file = os.path.join(root, file)
             dest_file = os.path.join(dest_path, file)
-            plog(f"Copying {src_file} to {dest_file}")
-
             try:
                 shutil.copy2(src_file, dest_file)
+                plog(f"Copied {src_file} to {dest_file}")
             except PermissionError:
-                print(f"Permission denied: {src_file}")
+                plog(f"Permission denied: {src_file}")
                 continue
-            except Exception as e:
-                plog(f"Error copying {src_file}: {e}")
-                continue
-            copied_files += 1
-            progress_var.set(int((copied_files / total_files) * 100))
-            progress_bar.update_idletasks()
+
+
+def format_sd_card(device):
+    if os.name == "posix":
+        if os.uname().sysname == "Darwin":
+            # macOS: Use diskutil to erase the disk
+            plog(f"Formatting {device} on macOS")
+            subprocess.run(["diskutil", "eraseDisk", "JHFS+", "SDCard", device])
+        else:
+            # Linux: Use mkfs to format the disk
+            plog(f"Formatting {device} on Linux")
+            subprocess.run(["mkfs.ext4", device])
+    elif os.name == "nt":
+        # Windows: Use format command
+        plog(f"Formatting {device} on Windows")
+        subprocess.run(["format", device, "/FS:NTFS", "/P:1"], input=b"Y\n", text=True)
 
 
 def create_gui(mounts):
@@ -158,8 +159,17 @@ def create_gui(mounts):
         for var, mount in zip(checkbox_vars, mounts):
             if var.get():
                 selected_mounts.append(mount["mount_point"])
-        write_selected_mounts(selected_mounts)
+        # write_selected_mounts(selected_mounts)
         root.quit()
+
+    def on_format():
+        selected_mounts.clear()
+        for var, mount in zip(checkbox_vars, mounts):
+            if var.get():
+                selected_mounts.append(mount["device"])
+        root.quit()
+        for device in selected_mounts:
+            format_sd_card(device)
 
     frame = ttk.Frame(root, padding="10")
     frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -171,8 +181,11 @@ def create_gui(mounts):
         checkbox.grid(sticky=tk.W)
         checkbox_vars.append(var)
 
-    button = ttk.Button(frame, text="Save Selected Mounts", command=on_select)
-    button.grid(sticky=tk.W)
+    button_save = ttk.Button(frame, text="Save Selected Mounts", command=on_select)
+    button_save.grid(sticky=tk.W)
+
+    button_format = ttk.Button(frame, text="Format Mounts", command=on_format)
+    button_format.grid(sticky=tk.W)
 
     # Center the window on the screen
     root.update_idletasks()
@@ -192,25 +205,22 @@ def create_gui(mounts):
         base_destination_dir = f"./data-{timestamp}"
         os.makedirs(base_destination_dir, exist_ok=True)
 
-        progress_root = tk.Tk()
-        progress_root.title("Copying Files")
+        def copy_files():
+            for i, mount_point in enumerate(selected_mounts):
+                mount_name = os.path.basename(mount_point.strip("/"))
+                unique_destination_dir = os.path.join(base_destination_dir, f"{mount_name}_{i}")
+                copy_sd_card_contents(mount_point, unique_destination_dir)
 
-        for mount_point in selected_mounts:
-            progress_var = tk.IntVar()
-            progress_bar = ttk.Progressbar(progress_root, variable=progress_var, maximum=100)
-            progress_bar.pack(fill=tk.X, expand=1, padx=10, pady=10)
+        threading.Thread(target=copy_files).start()
 
-            mount_name = os.path.basename(mount_point.strip("/"))
-            destination_dir = os.path.join(base_destination_dir, mount_name)
-            copy_sd_card_contents(mount_point, destination_dir, progress_var, progress_bar)
 
-            progress_bar.destroy()
-
-        progress_root.destroy()
+def signal_handler(sig, frame):
+    plog("Exiting gracefully...")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
     mounts = get_mounts()
     mounts = [m for m in mounts if "/Volumes" in m["mount_point"] and "/System/Volumes" not in m["mount_point"]]
-    print(mounts)
     create_gui(mounts)
