@@ -1,3 +1,4 @@
+from dataclasses import dataclass, field
 import os
 import shutil
 import subprocess
@@ -6,7 +7,34 @@ from tkinter import ttk
 from datetime import datetime
 import threading
 import signal
-import sys
+import itertools
+from urllib.request import urlopen
+import tkinter.messagebox as messagebox
+
+
+def bytes_to_human_readable(num_bytes):
+    """
+    Convert bytes to a human-readable string (e.g., KB, MB, GB).
+    """
+    step_unit = 1024
+    units = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
+
+    for unit in units:
+        if num_bytes < step_unit:
+            return f"{num_bytes:.2f} {unit}"
+        num_bytes /= step_unit
+
+    return f"{num_bytes:.2f} YB"  # In case the number is extremely large
+
+
+@dataclass
+class Context:
+    mount_point: str
+    root: tk.Tk
+    current_file_var: tk.StringVar
+    base_destination: str
+    gif_frames: list = field(default_factory=list)
+    stop_animation: threading.Event = None
 
 
 def plog(message):
@@ -78,11 +106,10 @@ def read_mounts_linux():
     return mounts
 
 
-
 def read_mounts_windows():
     mounts = []
     result = subprocess.run(
-        ["wmic", "logicaldisk", "get", "DeviceID,FileSystem,Size,FreeSpace"],
+        ["wmic", "logicaldisk", "get", "DeviceID,FileSystem,Size,FreeSpace,VolumeName"],
         capture_output=True,
         text=True,
     )
@@ -95,8 +122,10 @@ def read_mounts_windows():
             mount_info["is_sd_card"] = is_sd_card(mount_info["DeviceID"], None)
             mount_info["mount_point"] = mount_info["DeviceID"]
             mount_info["device"] = mount_info["DeviceID"].replace(":", "")
+            mount_info["Size"] = bytes_to_human_readable(int(mount_info["Size"]))
             mounts.append(mount_info)
     return mounts
+
 
 def get_mounts():
     if os.name == "posix":
@@ -115,13 +144,13 @@ def write_selected_mounts(selected_mounts, filename="selected_mounts.txt"):
             f.write(f"{mount}\n")
 
 
-def copy_sd_card_contents(mount_point, destination_dir, gui_root, current_file_var):
-    print(f"copy_sd_card_contents: {gui_root=}")
-    if not os.path.exists(destination_dir):
-        os.makedirs(destination_dir)
-    for root, dirs, files in os.walk(mount_point):
-        relative_path = os.path.relpath(root, mount_point)
-        dest_path = os.path.join(destination_dir, relative_path)
+def copy_sd_card_contents(ctx: Context):
+    print(f"copy_sd_card_contents: {ctx.root=}")
+    if not os.path.exists(ctx.base_destination):
+        os.makedirs(ctx.base_destination)
+    for root, dirs, files in os.walk(ctx.mount_point):
+        relative_path = os.path.relpath(root, ctx.mount_point)
+        dest_path = os.path.join(ctx.base_destination, relative_path)
         if not os.path.exists(dest_path):
             os.makedirs(dest_path)
         for file in files:
@@ -130,8 +159,8 @@ def copy_sd_card_contents(mount_point, destination_dir, gui_root, current_file_v
             try:
                 shutil.copy2(src_file, dest_file)
                 plog(f"Copied {src_file} to {dest_file}")
-                current_file_var.set(f"Copying: {src_file}")
-                gui_root.update_idletasks()  # Refresh the UI
+                ctx.current_file_var.set(f"Copying: {src_file}")
+                ctx.root.update_idletasks()  # Refresh the UI
 
             except PermissionError:
                 plog(f"Permission denied: {src_file}")
@@ -153,17 +182,38 @@ def format_sd_card(device):
         plog(f"Formatting {device} on Windows")
         subprocess.run(["format", device, "/FS:NTFS", "/P:1"], input=b"Y\n", text=True)
 
-def copy_files(selected_mounts, base_destination_dir, root, current_file_var):
-    print(f"{root=}")
+
+def copy_files(ctx: Context, selected_mounts: list):
+    print(f"{ctx.root=}")
     for i, mount_point in enumerate(selected_mounts):
         mount_name = os.path.basename(mount_point.strip("/"))
-        unique_destination_dir = os.path.join(base_destination_dir, f"{mount_name}_{i}")
-        copy_sd_card_contents(mount_point, unique_destination_dir, root, current_file_var)
-    current_file_var.set("Done copying !")
-    root.update_idletasks()
+        ctx.base_destination = os.path.join(ctx.base_destination, f"{mount_name}_{i}")
+        ctx.mount_point = mount_point
+        # print(ctx)
+        # raise SystemExit
+        copy_sd_card_contents(ctx)
+    ctx.activity_label.config(image="")
+    ctx.stop_animation.set()
+    ctx.current_file_var.set("Done copying !")
+    ctx.root.update_idletasks()
 
 
-def create_gui(mounts, base_destination_dir):
+def get_gif_frames():
+    gif_url = "https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif"
+    response = urlopen(gif_url)
+    gif_data = response.read()
+    gif_image = tk.PhotoImage(data=gif_data)
+    gif_frames = []
+    try:
+        while True:
+            gif_frames.append(gif_image.copy())
+            gif_image.tk.call(gif_image, "configure", "-format", f"gif -index {len(gif_frames)}")
+    except tk.TclError:
+        pass
+    return gif_frames
+
+
+def create_gui(mounts, base_destination):
     root = tk.Tk()
     root.geometry("800x600")
 
@@ -174,36 +224,71 @@ def create_gui(mounts, base_destination_dir):
     current_file_var.set("Ready to copy files")
     selected_mounts = []
 
+    activity_label = ttk.Label(root)
+    activity_label.grid(row=1, column=1, sticky=tk.W, padx=10, pady=10)
+    stop_animation = threading.Event()
+
+    gif_frames = get_gif_frames()
+
+    destination_label = ttk.Label(root, text="Destination Directory:")
+    destination_label.grid(row=0, column=0, sticky=tk.W, padx=10, pady=10)
+
+    destination_var = tk.StringVar(value=base_destination)
+    destination_entry = ttk.Entry(root, textvariable=destination_var, width=50)
+    destination_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=10, pady=10)
+
+    ctx = Context(
+        mount_point=None,
+        root=root,
+        current_file_var=current_file_var,
+        base_destination=base_destination,
+        gif_frames=gif_frames,
+        stop_animation=stop_animation,
+    )
+
+    def animate_gif(stop_animation):
+        for frame in itertools.cycle(ctx.gif_frames):
+            if stop_animation.is_set():
+                break
+            ctx.activity_label.config(image=frame)
+            ctx.root.update_idletasks()
+            ctx.root.after(100)
+
     def on_select():
+        ctx.base_destination = destination_var.get()
         selected_mounts.clear()
         for var, mount in zip(checkbox_vars, mounts):
             if var.get():
                 selected_mounts.append(mount["mount_point"])
-        print(selected_mounts)
+        # print(selected_mounts)
         if selected_mounts:
-            os.makedirs(base_destination_dir, exist_ok=True)
-            threading.Thread(target=copy_files, args=(selected_mounts, base_destination_dir, root, current_file_var)).start()
-
+            
+            os.makedirs(ctx.base_destination, exist_ok=True)
+            threading.Thread(target=animate_gif).start()
+            threading.Thread(
+                target=copy_files,
+                args=(ctx, selected_mounts),
+            ).start()
 
     def on_format():
         selected_mounts.clear()
         for var, mount in zip(checkbox_vars, mounts):
             if var.get():
                 selected_mounts.append(mount["device"])
-        root.quit()
-        for device in selected_mounts:
-            format_sd_card(device)
 
+        if not selected_mounts:
+            messagebox.showwarning("No Selection", "No mounts selected for formatting.")
+            return
 
-    destination_label = ttk.Label(root, text="Destination Directory:")
-    destination_label.grid(row=0, column=0, sticky=tk.W, padx=10, pady=10)
-
-    destination_var = tk.StringVar(value=base_destination_dir)
-    destination_entry = ttk.Entry(root, textvariable=destination_var, width=50)
-    destination_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=10, pady=10)
+        confirm = messagebox.askyesno(
+            "Confirm Format", "This will forever delete all data from the selected mounts. Continue?"
+        )
+        if confirm:
+            root.quit()
+            for device in selected_mounts:
+                format_sd_card(device)
 
     # frame.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
-
 
     frame = ttk.Frame(root, padding="10")
     frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
@@ -211,7 +296,9 @@ def create_gui(mounts, base_destination_dir):
     checkbox_vars = []
     for mount in mounts:
         var = tk.BooleanVar()
-        checkbox = ttk.Checkbutton(frame, text=f"{mount['mount_point']} ({mount['device']})", variable=var)
+        checkbox = ttk.Checkbutton(
+            frame, text=f"{mount['mount_point']} ({mount.get('VolumeName')}, {mount.get('Size')})", variable=var
+        )
         checkbox.grid(sticky=tk.W)
         checkbox_vars.append(var)
 
@@ -231,25 +318,27 @@ def create_gui(mounts, base_destination_dir):
     position_right = int(screen_width / 2 - window_width / 2)
     root.geometry(f"{window_width}x{window_height}+{position_right}+{position_top}")
 
+    def signal_handler(sig, frame):
+        print("Exiting gracefully...")
+        root.quit()
+        exit(0)
 
-    print(f"{selected_mounts=}")
-    if selected_mounts:
-        os.makedirs(base_destination_dir, exist_ok=True)
+    signal.signal(signal.SIGINT, signal_handler)
 
-
-        threading.Thread(target=copy_files).start()
     root.mainloop()
 
 
 def signal_handler(sig, frame):
-    plog("Exiting gracefully...")
-    sys.exit(0)
+    print("Exiting gracefully...")
+    exit(0)
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     mounts = get_mounts()
     # mounts = [m for m in mounts if "/Volumes" in m["mount_point"] and "/System/Volumes" not in m["mount_point"]]
+    # print(mounts)
+    mounts = [m for m in mounts if m["device"] != "C"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_destination_dir = f"./data-{timestamp}"
-    create_gui(mounts, base_destination_dir)
+    base_destination = f"./data-{timestamp}"
+    create_gui(mounts, base_destination)
