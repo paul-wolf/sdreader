@@ -10,6 +10,7 @@ import signal
 import itertools
 from urllib.request import urlopen
 import tkinter.messagebox as messagebox
+import plistlib
 
 
 def bytes_to_human_readable(num_bytes):
@@ -35,6 +36,7 @@ class Context:
     base_destination: str
     gif_frames: list = field(default_factory=list)
     stop_animation: threading.Event = None
+    activity_label: ttk.Label = None
 
 
 def plog(message):
@@ -68,21 +70,22 @@ def is_sd_card(device, mount_point):
 
 def read_mounts_mac():
     mounts = []
-    result = subprocess.run(["mount"], capture_output=True, text=True)
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        device = parts[0]
-        mount_point = parts[2]
-        filesystem_type = parts[4].strip("()")
-        options = parts[5].strip("()")
-        mount_info = {
-            "device": device,
-            "mount_point": mount_point,
-            "filesystem_type": filesystem_type,
-            "options": options,
-            "is_sd_card": is_sd_card(device, mount_point),
-        }
-        mounts.append(mount_info)
+    result = subprocess.run(["diskutil", "list", "-plist"], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("Failed to run diskutil list")
+
+    disk_info = plistlib.loads(result.stdout.encode())
+    for disk in disk_info.get("AllDisksAndPartitions", []):
+        for partition in disk.get("Partitions", []):
+            if partition.get("MountPoint"):
+                mount_info = {
+                    "device": partition.get("DeviceIdentifier"),
+                    "mount_point": partition.get("MountPoint"),
+                    "filesystem_type": partition.get("Type"),
+                    "options": partition.get("VolumeName"),
+                    "is_sd_card": is_sd_card(partition.get("DeviceIdentifier"), partition.get("MountPoint")),
+                }
+                mounts.append(mount_info)
     return mounts
 
 
@@ -148,9 +151,12 @@ def copy_sd_card_contents(ctx: Context):
     print(f"copy_sd_card_contents: {ctx.root=}")
     if not os.path.exists(ctx.base_destination):
         os.makedirs(ctx.base_destination)
+    print(f"Copying files from {ctx.mount_point} to {ctx.base_destination}")
     for root, dirs, files in os.walk(ctx.mount_point):
         relative_path = os.path.relpath(root, ctx.mount_point)
+
         dest_path = os.path.join(ctx.base_destination, relative_path)
+        print(f"{ctx=}, {relative_path=}, {dest_path=}")
         if not os.path.exists(dest_path):
             os.makedirs(dest_path)
         for file in files:
@@ -184,7 +190,6 @@ def format_sd_card(device):
 
 
 def copy_files(ctx: Context, selected_mounts: list):
-    print(f"{ctx.root=}")
     for i, mount_point in enumerate(selected_mounts):
         mount_name = os.path.basename(mount_point.strip("/"))
         ctx.base_destination = os.path.join(ctx.base_destination, f"{mount_name}_{i}")
@@ -244,6 +249,7 @@ def create_gui(mounts, base_destination):
         base_destination=base_destination,
         gif_frames=gif_frames,
         stop_animation=stop_animation,
+        activity_label=activity_label,
     )
 
     def animate_gif(stop_animation):
@@ -262,9 +268,8 @@ def create_gui(mounts, base_destination):
                 selected_mounts.append(mount["mount_point"])
         # print(selected_mounts)
         if selected_mounts:
-            
             os.makedirs(ctx.base_destination, exist_ok=True)
-            threading.Thread(target=animate_gif).start()
+            threading.Thread(target=animate_gif, args=(stop_animation,)).start()
             threading.Thread(
                 target=copy_files,
                 args=(ctx, selected_mounts),
@@ -325,6 +330,9 @@ def create_gui(mounts, base_destination):
 
     signal.signal(signal.SIGINT, signal_handler)
 
+    quit_button = ttk.Button(root, text="Quit", command=root.quit)
+    quit_button.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=10, pady=10)
+
     root.mainloop()
 
 
@@ -337,7 +345,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     mounts = get_mounts()
     # mounts = [m for m in mounts if "/Volumes" in m["mount_point"] and "/System/Volumes" not in m["mount_point"]]
-    # print(mounts)
+    print(mounts)
     mounts = [m for m in mounts if m["device"] != "C"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_destination = f"./data-{timestamp}"
